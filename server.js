@@ -61,77 +61,113 @@ app.get('/live', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
 
   const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), 15000);
-  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
-
-  const args = ['--accept-license', '--accept-gdpr', '-s', String(SERVER_ID), '-f', 'jsonl'];
-  // inside app.get('/live', ...) before spawn:
-exec(`which ${SPEEDTEST_BIN}`, (whichErr) => {
-  if (whichErr) {
-    send({ type: 'error', message: 'speedtest binary not found on server. Live test unavailable.' });
-    clearInterval(keepAlive);
-    return res.end();
-  }
-  // proceed to spawn normally...
-});
-
-  const child = spawn(SPEEDTEST_BIN, args, { windowsHide: true });
-
-  let stdoutBuf = '';
-  let inUploadPhase = false;   // flag: stop storing progress once upload begins
-  let lastDownloadMbps = null;
-  let lastUploadMbps = null;
-
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (chunk) => {
-    stdoutBuf += chunk;
-
-    let idx;
-    while ((idx = stdoutBuf.indexOf('\n')) >= 0) {
-      const line = stdoutBuf.slice(0, idx).trim();
-      stdoutBuf = stdoutBuf.slice(idx + 1);
-      if (!line) continue;
-
-      let obj;
-      try { obj = JSON.parse(line); } catch { continue; }
-
-      if (obj.type === 'download' && obj.download?.bandwidth != null && !inUploadPhase) {
-        const mbps = (obj.download.bandwidth * 8) / 1e6;
-        lastDownloadMbps = mbps;
-        send({ type: 'progress', phase: 'download', mbps, t: Date.now() });
-        continue;
-      }
-
-      if (obj.type === 'upload' && obj.upload?.bandwidth != null) {
-        inUploadPhase = true; // once upload starts, stop sending progress updates
-        lastUploadMbps = (obj.upload.bandwidth * 8) / 1e6;
-        continue;
-      }
-
-      if (obj.type === 'result') {
-        const downMbps = obj.download?.bandwidth ? (obj.download.bandwidth * 8) / 1e6 : lastDownloadMbps ?? null;
-        const upMbps   = obj.upload?.bandwidth   ? (obj.upload.bandwidth   * 8) / 1e6 : lastUploadMbps   ?? null;
-        send({ type: 'final', downMbps, upMbps, json: obj, t: Date.now() });
-      }
-    }
-  });
-
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (s) => {
-    // optionally log
-  });
-
-  const finish = () => {
-    clearInterval(keepAlive);
-    try { child.kill('SIGKILL'); } catch {}
-    res.end();
+  const send = (obj) => {
+    try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch (e) { /* ignore */ }
   };
 
-  child.on('close', finish);
-  child.on('error', (e) => { send({ type: 'error', message: e.message }); finish(); });
-  req.on('close', () => { send({ type: 'aborted' }); finish(); });
+  // Helper to finish and cleanup
+  const finish = (child) => {
+    clearInterval(keepAlive);
+    try { if (child && !child.killed) child.kill('SIGKILL'); } catch (e) {}
+    try { res.end(); } catch (e) {}
+  };
 
-  send({ type: 'start', serverId: SERVER_ID, t: Date.now() });
+  // Cross-platform check for binary:
+  if (isWin) {
+    // On Windows check file exists
+    if (!fs.existsSync(SPEEDTEST_BIN)) {
+      send({ type: 'error', message: 'speedtest binary not found on server. Live test unavailable.' });
+      finish();
+      return;
+    }
+    // proceed to spawn...
+    spawnAndStream();
+    return;
+  }
+
+  // On Unix-like, use `which` to check PATH (async)
+  exec(`which ${SPEEDTEST_BIN}`, (whichErr, stdout) => {
+    if (whichErr || !stdout || !stdout.trim()) {
+      send({ type: 'error', message: 'speedtest binary not found on server. Live test unavailable.' });
+      finish();
+      return;
+    }
+    // binary exists in PATH — spawn
+    spawnAndStream();
+  });
+
+  // spawn & streaming logic in a function so we only call it when binary is present
+  function spawnAndStream() {
+    const args = ['--accept-license', '--accept-gdpr', '-s', String(SERVER_ID), '-f', 'jsonl'];
+    const child = spawn(SPEEDTEST_BIN, args, { windowsHide: true });
+
+    let stdoutBuf = '';
+    let inUploadPhase = false;
+    let lastDownloadMbps = null;
+    let lastUploadMbps = null;
+
+    // lifecycle logs for Render (helpful)
+    console.log('[SSE] spawned speedtest pid=', child.pid);
+
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdoutBuf += chunk;
+      let idx;
+      while ((idx = stdoutBuf.indexOf('\n')) >= 0) {
+        const line = stdoutBuf.slice(0, idx).trim();
+        stdoutBuf = stdoutBuf.slice(idx + 1);
+        if (!line) continue;
+        let obj;
+        try { obj = JSON.parse(line); } catch (e) { continue; }
+
+        if (obj.type === 'download' && obj.download?.bandwidth != null && !inUploadPhase) {
+          const mbps = (obj.download.bandwidth * 8) / 1e6;
+          lastDownloadMbps = mbps;
+          send({ type: 'progress', phase: 'download', mbps, t: Date.now() });
+          continue;
+        }
+
+        if (obj.type === 'upload' && obj.upload?.bandwidth != null) {
+          inUploadPhase = true;
+          lastUploadMbps = (obj.upload.bandwidth * 8) / 1e6;
+          continue;
+        }
+
+        if (obj.type === 'result') {
+          const downMbps = obj.download?.bandwidth ? (obj.download.bandwidth * 8) / 1e6 : lastDownloadMbps ?? null;
+          const upMbps   = obj.upload?.bandwidth   ? (obj.upload.bandwidth   * 8) / 1e6 : lastUploadMbps   ?? null;
+          send({ type: 'final', downMbps, upMbps, json: obj, t: Date.now() });
+        }
+      }
+    });
+
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (s) => {
+      console.error('[SSE] speedtest stderr:', s.toString().slice(0,1000));
+    });
+
+    child.on('close', (code, signal) => {
+      console.log(`[SSE] child closed. code=${code} signal=${signal}`);
+      finish(child);
+    });
+
+    child.on('error', (e) => {
+      console.error('[SSE] spawn error:', e && e.stack ? e.stack : e);
+      send({ type: 'error', message: e && e.message ? e.message : String(e) });
+      finish(child);
+    });
+
+    req.on('close', () => {
+      console.log('[SSE] client closed connection');
+      send({ type: 'aborted' });
+      finish(child);
+    });
+
+    // initial event
+    send({ type: 'start', serverId: SERVER_ID, t: Date.now() });
+  }
 });
+
 
 
 // ---- Optional legacy JSON on separate port ----
