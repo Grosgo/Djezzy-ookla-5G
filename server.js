@@ -5,8 +5,11 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const os = require('os');
 
-
+// Configuration
+const SIMULATE = process.env.SIMULATE === '1' || false;
+console.log('[STARTUP] SIMULATE=', SIMULATE, 'PORT=', process.env.PORT);
 
 // create the express app BEFORE using it
 const app = express();
@@ -22,21 +25,109 @@ const FRONTEND_DIR = path.join(__dirname, 'frontend');
 app.use(cors());
 app.use(express.static(FRONTEND_DIR));
 
+// -------------------------
+// Debug endpoints
+// -------------------------
 
-// Debug endpoint — returns where speedtest is or an error (useful to test deployed container)
-app.get('/debug/check-binary', (req, res) => {
-  exec('which speedtest', (err, stdout, stderr) => {
-    if (err) {
-      // include stderr text if available for easier debugging
-      return res.json({ ok: false, error: err.message || stderr || 'not found' });
-    }
-    return res.json({ ok: true, path: stdout.trim() });
+// Helper to run a command with limits and return promise
+function runCmd(cmd, opts = {}) {
+  const { timeout = 10000, maxBuffer = 1024 * 1024 } = opts;
+  return new Promise((resolve) => {
+    exec(cmd, { timeout, maxBuffer }, (err, stdout, stderr) => {
+      if (err) {
+        resolve({ ok: false, error: err.message, stderr: (stderr || '').toString().slice(0, 2000) });
+      } else {
+        resolve({ ok: true, out: (stdout || '').toString().slice(0, 20000) });
+      }
+    });
   });
+}
+
+// 1) Check binary presence using which (Unix) or file existence on Win
+app.get('/debug/check-binary', async (req, res) => {
+  if (isWin) {
+    const p = SPEEDTEST_BIN;
+    try {
+      const exists = fs.existsSync(p);
+      return res.json({ ok: exists, path: exists ? p : null, platform: 'win32' });
+    } catch (e) {
+      return res.json({ ok: false, error: e.message });
+    }
+  }
+  const result = await runCmd(`which ${SPEEDTEST_BIN}`);
+  if (!result.ok) return res.json({ ok: false, message: 'binary not found', details: result });
+  return res.json({ ok: true, path: result.out.trim() });
 });
 
+// 2) Speedtest version (if available)
+app.get('/debug/speedtest-version', async (req, res) => {
+  if (isWin) {
+    // Windows: try spawn with --version if file exists
+    if (!fs.existsSync(SPEEDTEST_BIN)) return res.json({ ok: false, error: 'binary not present' });
+    try {
+      const r = await runCmd(`"${SPEEDTEST_BIN}" --version`, { timeout: 5000 });
+      return res.json(r);
+    } catch (e) {
+      return res.json({ ok: false, error: e.message });
+    }
+  }
+  const whichRes = await runCmd(`which ${SPEEDTEST_BIN}`);
+  if (!whichRes.ok) return res.json({ ok: false, message: 'binary not found', details: whichRes });
+  const pathToBin = whichRes.out.trim();
+  const v = await runCmd(`"${pathToBin}" --version`);
+  return res.json(v);
+});
+
+// 3) List binary file (ls -l) — useful to check permissions and location
+app.get('/debug/list-bin', async (req, res) => {
+  if (isWin) {
+    // On Windows return file info if present
+    if (!fs.existsSync(SPEEDTEST_BIN)) return res.json({ ok: false, error: 'binary not present' });
+    const s = fs.statSync(SPEEDTEST_BIN);
+    return res.json({
+      ok: true,
+      path: SPEEDTEST_BIN,
+      size: s.size,
+      mode: s.mode,
+      mtime: s.mtime,
+    });
+  }
+  const whichRes = await runCmd(`which ${SPEEDTEST_BIN}`);
+  if (!whichRes.ok) return res.json({ ok: false, message: 'binary not found', details: whichRes });
+  const pathToBin = whichRes.out.trim();
+  const lsRes = await runCmd(`ls -l ${pathToBin}`);
+  return res.json(lsRes);
+});
+
+// 4) Small safe env dump — only non-secret helpful vars
+app.get('/debug/env', (req, res) => {
+  const safe = {
+    NODE_ENV: process.env.NODE_ENV || null,
+    PORT: process.env.PORT || null,
+    SIMULATE: process.env.SIMULATE || null,
+    SERVER_ID: process.env.SERVER_ID || null,
+    RENDER: process.env.RENDER || null,
+    HOSTNAME: os.hostname(),
+    platform: process.platform,
+    arch: process.arch,
+  };
+  res.json({ ok: true, env: safe });
+});
+
+// 5) Processes (limited) — ps aux head -n 60
+app.get('/debug/ps', async (req, res) => {
+  if (isWin) {
+    return res.json({ ok: false, message: 'ps not supported on Windows via this endpoint' });
+  }
+  const ps = await runCmd('ps aux | head -n 60');
+  res.json(ps);
+});
+
+// -------------------------
+// Health & API
+// -------------------------
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ---- One-shot JSON (final result) ----
 // ---- One-shot JSON (final result) ----
 function runSpeedtestJSON(res) {
   // Build the command string (shell form so we can pass flags)
@@ -177,8 +268,6 @@ app.get('/live', (req, res) => {
   }
 });
 
-
-
 // ---- Optional legacy JSON on separate port ----
 // ---- Legacy JSON route (served on the same port for compatibility) ----
 app.get('/legacy/speedtest', (req, res) => {
@@ -194,4 +283,3 @@ http.createServer(app).listen(PORT, () => {
   console.log(`JSON (alias): http://localhost:${PORT}/speedtest`);
   console.log(`Legacy JSON : http://localhost:${PORT}/legacy/speedtest`);
 });
-
