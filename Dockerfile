@@ -1,30 +1,31 @@
-# Use lightweight Node image
+# Dockerfile - Node 18 + Ookla Speedtest CLI installed via official .deb
 FROM node:18-slim
 
-# Install dependencies (curl, ca-certificates, gnupg)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates gnupg \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Ookla Speedtest CLI directly from official .deb
+# Install small required tools
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl ca-certificates gnupg apt-transport-https \
+  && rm -rf /var/lib/apt/lists/*
+
+# Download and install Ookla Speedtest CLI .deb (pin to a known stable version)
+# If you want the latest, you can change the filename to the latest release .deb
 RUN curl -sLo /tmp/speedtest.deb https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.deb \
-    && dpkg -i /tmp/speedtest.deb || apt-get install -y -f \
-    && rm /tmp/speedtest.deb
+  && dpkg -i /tmp/speedtest.deb || (apt-get update && apt-get install -y -f) \
+  && rm -f /tmp/speedtest.deb
 
-# Set workdir
+# Create app directory
 WORKDIR /app
 
-# Copy package.json first (for caching)
+# Copy package files and install dependencies (cache layer)
 COPY package*.json ./
+RUN npm ci --only=production || npm install --production
 
-# Install node dependencies
-RUN npm install --production
-
-# Copy all app files
+# Copy application files
 COPY . .
 
-# Expose port (Render uses $PORT)
-EXPOSE 10000
+# Expose port (Render uses environment variable PORT)
+EXPOSE 8080
 
 # Start the app
 CMD ["npm", "start"]
