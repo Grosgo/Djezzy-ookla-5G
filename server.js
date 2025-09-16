@@ -1,31 +1,49 @@
-// server.js — Express app with live SSE progress via Ookla JSONL + JSON endpoints
+// server.js — Express app with live SSE progress via Ookla JSONL + JSON endpoints 
 const express = require('express');
 const { spawn, exec } = require('child_process');
 const http = require('http');
 const path = require('path');
+const fs = require('fs');
+const cors = require('cors');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const LEGACY_PORT = parseInt(process.env.LEGACY_PORT || '3000', 10);
+const LEGACY_PORT = parseInt(process.env.LEGACY_PORT || '3000', 10); // unused on Render
 const SERVER_ID = process.env.SERVER_ID || 32700; // e.g., Djezzy Oran
 const isWin = process.platform === 'win32';
 const SPEEDTEST_BIN = isWin ? path.join(__dirname, 'speedtest.exe') : 'speedtest';
 const FRONTEND_DIR = path.join(__dirname, 'frontend');
 
+// Allow browser clients from other origins while testing (restrict later if needed)
+app.use(cors());
 app.use(express.static(FRONTEND_DIR));
+
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // ---- One-shot JSON (final result) ----
+// ---- One-shot JSON (final result) ----
 function runSpeedtestJSON(res) {
-  // Use final JSON format here
+  // Build the command string (shell form so we can pass flags)
   const cmd = `"${SPEEDTEST_BIN}" --accept-license --accept-gdpr -s ${SERVER_ID} -f json`;
+
+  // Try exec — if the binary is missing exec will call the callback with an error.
   exec(cmd, { maxBuffer: 1024 * 1024 * 64 }, (err, stdout, stderr) => {
-    if (err) return res.status(500).json({ error: err.message, stderr });
-    try { res.json(JSON.parse(stdout)); }
-    catch { res.status(500).json({ error: 'Parse error', sample: stdout?.slice(0, 2000) || '' }); }
+    if (err) {
+      // Helpful error for missing binary (ENOENT) or other failures
+      if (err.code === 'ENOENT' || /not found|No such file|cannot find/i.test(err.message + (stderr || ''))) {
+        return res.status(500).json({ error: 'speedtest binary not found on server. Deploy with the binary or use a Docker image that includes it.' });
+      }
+      return res.status(500).json({ error: err.message, stderr });
+    }
+    try {
+      res.json(JSON.parse(stdout));
+    } catch (parseErr) {
+      res.status(500).json({ error: 'Parse error', parseError: parseErr.message, sample: stdout?.slice(0, 2000) || '' });
+    }
   });
 }
+
 app.get('/api/speedtest', (req, res) => runSpeedtestJSON(res));
 app.get('/speedtest', (req, res) => runSpeedtestJSON(res));
 
@@ -40,6 +58,16 @@ app.get('/live', (req, res) => {
   const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
   const args = ['--accept-license', '--accept-gdpr', '-s', String(SERVER_ID), '-f', 'jsonl'];
+  // inside app.get('/live', ...) before spawn:
+exec(`which ${SPEEDTEST_BIN}`, (whichErr) => {
+  if (whichErr) {
+    send({ type: 'error', message: 'speedtest binary not found on server. Live test unavailable.' });
+    clearInterval(keepAlive);
+    return res.end();
+  }
+  // proceed to spawn normally...
+});
+
   const child = spawn(SPEEDTEST_BIN, args, { windowsHide: true });
 
   let stdoutBuf = '';
@@ -101,16 +129,18 @@ app.get('/live', (req, res) => {
 
 
 // ---- Optional legacy JSON on separate port ----
-const legacy = express();
-legacy.use((_req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
-legacy.get('/speedtest', (req, res) => runSpeedtestJSON(res));
+// ---- Legacy JSON route (served on the same port for compatibility) ----
+app.get('/legacy/speedtest', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  return runSpeedtestJSON(res);
+});
 
+// Start single HTTP server (Render attaches public domain)
 http.createServer(app).listen(PORT, () => {
   console.log(`Frontend    : http://localhost:${PORT}/`);
   console.log(`Live SSE    : http://localhost:${PORT}/live`);
   console.log(`JSON (new)  : http://localhost:${PORT}/api/speedtest`);
   console.log(`JSON (alias): http://localhost:${PORT}/speedtest`);
+  console.log(`Legacy JSON : http://localhost:${PORT}/legacy/speedtest`);
 });
-http.createServer(legacy).listen(LEGACY_PORT, () => {
-  console.log(`Legacy JSON : http://localhost:${LEGACY_PORT}/speedtest`);
-});
+
