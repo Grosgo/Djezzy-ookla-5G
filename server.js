@@ -5,22 +5,24 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
-app.use(cors());
-app.use(express.static(path.join(__dirname, 'frontend')));
 
+const SIMULATE = process.env.SIMULATE === '1';
+console.log('[STARTUP] SIMULATE=', SIMULATE, 'PORT=', process.env.PORT);
+
+// create the express app BEFORE using it
 const app = express();
+
 const PORT = parseInt(process.env.PORT || '8080', 10);
-// remove SIMULATE logic or ensure process.env.SIMULATE !== '1'
-app.listen(PORT, () => console.log('listening on', PORT));
 const LEGACY_PORT = parseInt(process.env.LEGACY_PORT || '3000', 10); // unused on Render
 const SERVER_ID = process.env.SERVER_ID || 32700; // e.g., Djezzy Oran
 const isWin = process.platform === 'win32';
 const SPEEDTEST_BIN = isWin ? path.join(__dirname, 'speedtest.exe') : 'speedtest';
 const FRONTEND_DIR = path.join(__dirname, 'frontend');
 
-// Allow browser clients from other origins while testing (restrict later if needed)
+// middlewares
 app.use(cors());
 app.use(express.static(FRONTEND_DIR));
+
 
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
