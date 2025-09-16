@@ -114,8 +114,22 @@ function cleanupStream(btnLabel) {
   }
 }
 
+/**
+ * runSpeedTestLive()
+ * - Opens an EventSource to the backend /live endpoint
+ * - Streams progress events, updates UI, and logs everything to the console for debugging
+ * - Uses global `API_BASE` if present (e.g. set to "https://my-backend.example")
+ */
 function runSpeedTestLive() {
-  if (es) { es.close(); es = null; }
+  console.log('[CLIENT] Start button clicked');
+
+  // Prevent double-starts
+  if (es) {
+    console.log('[CLIENT] Closing existing EventSource before starting a new one');
+    es.close();
+    es = null;
+  }
+
   resetStats();
   setPhaseLabel('');
 
@@ -124,35 +138,65 @@ function runSpeedTestLive() {
     startButton.textContent = "Running…";
   }
 
-  // If your frontend is on another origin, use absolute URL:
-  // es = new EventSource('http://localhost:8080/live');
-  es = new EventSource("/live");
+  // Choose EventSource URL:
+  // If you host frontend and backend together, keep it relative: "/live"
+  // If you host frontend elsewhere, set window.API_BASE = 'https://your-backend' then it will use that origin.
+  const base = (typeof window.API_BASE === 'string' && window.API_BASE.trim()) ? window.API_BASE.replace(/\/+$/, '') : '';
+  const liveUrl = base ? `${base}/live` : '/live';
+
+  console.log('[CLIENT] EventSource URL ->', liveUrl);
+
+  try {
+    es = new EventSource(liveUrl);
+  } catch (e) {
+    console.error('[CLIENT] Failed to create EventSource', e);
+    cleanupStream("Retry Test");
+    setPhaseLabel('');
+    return;
+  }
+
+  console.log('[CLIENT] EventSource created, attaching handlers');
+
+  es.onopen = () => {
+    console.log('[CLIENT] SSE connection opened');
+  };
 
   es.onmessage = (evt) => {
-    let msg;
-    try { msg = JSON.parse(evt.data); } catch { return; }
+    // evt.data is a JSON string according to server contract
+    console.log('[CLIENT] SSE raw message:', evt.data);
 
-    if (msg.type === "start") {
-      // Optional: display selected server in UI
+    let msg;
+    try {
+      msg = JSON.parse(evt.data);
+    } catch (err) {
+      console.warn('[CLIENT] SSE parse error, ignoring message', err);
+      return;
+    }
+
+    // Handle different types we expect from server
+    if (msg.type === 'start') {
+      console.log('[CLIENT] server START event', msg);
+      // optional: display server info
       // setPhaseLabel(`Server: ${msg.server?.name ?? msg.serverId ?? ''}`);
       return;
     }
 
-    if (msg.type === "progress") {
-      // We may get phases: 'download', 'upload', or 'ping'
+    if (msg.type === 'progress') {
+      // phase may be 'download' | 'upload' | 'ping'
       if (msg.phase) setPhaseLabel(msg.phase);
-
       if (typeof msg.mbps === 'number') {
         const mbps = Math.max(0, msg.mbps);
         updateRunningStats(mbps);
-        updateSpeed(mbps);   // move needle + button label live
-        updateStatsUI();     // update rolling avg/peak/low live
+        updateSpeed(mbps);
+        updateStatsUI();
+      } else {
+        console.log('[CLIENT] progress without mbps', msg);
       }
       return;
     }
 
-    if (msg.type === "final") {
-      // Fold final values into stats in case they’re higher/lower
+    if (msg.type === 'final') {
+      console.log('[CLIENT] FINAL event', msg);
       if (Number.isFinite(msg.downMbps)) updateRunningStats(Math.max(0, msg.downMbps));
       if (Number.isFinite(msg.upMbps))   updateRunningStats(Math.max(0, msg.upMbps));
       updateStatsUI();
@@ -161,20 +205,34 @@ function runSpeedTestLive() {
       return;
     }
 
-    if (msg.type === "error" || msg.type === "aborted") {
-      console.error("Live test error/aborted:", msg);
+    if (msg.type === 'error') {
+      console.error('[CLIENT] server ERROR:', msg);
+      // Provide a visible label to the user if available
+      setPhaseLabel(msg.message || 'Error');
+      cleanupStream("Retry Test");
+      return;
+    }
+
+    if (msg.type === 'aborted') {
+      console.warn('[CLIENT] server ABORTED the test', msg);
       cleanupStream("Retry Test");
       setPhaseLabel('');
       return;
     }
+
+    // Unexpected message type
+    console.log('[CLIENT] Unknown SSE message type', msg);
   };
 
   es.onerror = (e) => {
-    console.error("SSE connection error", e);
+    // Note: EventSource fires onerror also when the connection closes normally.
+    console.error('[CLIENT] SSE connection error', e);
+    // If readyState == 2 (closed) or connection problems, cleanup and let user retry
     cleanupStream("Retry Test");
     setPhaseLabel('');
   };
 }
+
 
 // ==========================
 // Initial State & Events
