@@ -6,8 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 
-const SIMULATE = process.env.SIMULATE === '1';
-console.log('[STARTUP] SIMULATE=', SIMULATE, 'PORT=', process.env.PORT);
+
 
 // create the express app BEFORE using it
 const app = express();
@@ -24,6 +23,16 @@ app.use(cors());
 app.use(express.static(FRONTEND_DIR));
 
 
+// Debug endpoint — returns where speedtest is or an error (useful to test deployed container)
+app.get('/debug/check-binary', (req, res) => {
+  exec('which speedtest', (err, stdout, stderr) => {
+    if (err) {
+      // include stderr text if available for easier debugging
+      return res.json({ ok: false, error: err.message || stderr || 'not found' });
+    }
+    return res.json({ ok: true, path: stdout.trim() });
+  });
+});
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
